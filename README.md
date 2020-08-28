@@ -6,4 +6,6 @@ in which the tool rM2svg has been updated to support current lines format (as of
 
 This is a work in progress.
 
+Details here: <https://www.nemoworld.info/posts/2020/08/28/remarkable-custom-renderer/>
+
 Nicolas <nrdufour@gmail.com>
