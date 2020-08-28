@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+#
+# Script for converting reMarkable tablet ".rm" files to SVG image.
+# this works for the new *.rm format, where each page is a separate file
+# credits to
+# https://github.com/lschwetlick/maxio/tree/master/tools
+# which in turn credits
+# https://github.com/jmiserez/maxio/blob/ee15bcc86e4426acd5fc70e717468862dce29fb8/tmp-rm16-ericsfraga-rm2svg.py
+#
+
+import sys
+import struct
+import os.path
+import argparse
+import re
+import math
+
+
+__prog_name__ = "rm2svg"
+__version__ = "0.0.2.1"
+
+
+# Size
+default_x_width = 1404
+default_y_width = 1872
+
+# Mappings
+stroke_colour = {
+    0 : "black",
+    1 : "grey",
+    2 : "white",
+}
+'''stroke_width={
+    0x3ff00000 : 2,
+    0x40000000 : 4,
+    0x40080000 : 8,
+}'''
+
+
+def main():
+    parser = argparse.ArgumentParser(prog=__prog_name__)
+    parser.add_argument('--height',
+                        help='Desired height of image',
+                        type=float,
+                        default=default_y_width)
+    parser.add_argument('--width',
+                        help='Desired width of image',
+                        type=float,
+                        default=default_x_width)
+    parser.add_argument("-i",
+                        "--input",
+                        help=".rm input file",
+                        required=True,
+                        metavar="FILENAME",
+                        #type=argparse.FileType('r')
+                        )
+    parser.add_argument("-o",
+                        "--output",
+                        help="prefix for output files",
+                        required=True,
+                        metavar="NAME",
+                        #type=argparse.FileType('w')
+                        )
+    parser.add_argument("-c",
+                        "--coloured_annotations",
+                        help="Colour annotations for document markup.",
+                        action='store_true',
+                        )
+    parser.add_argument('--version',
+                        action='version',
+                        version='%(prog)s {version}'.format(version=__version__))
+    args = parser.parse_args()
+
+    if not os.path.exists(args.input):
+        parser.error('The file "{}" does not exist!'.format(args.input))
+    if args.coloured_annotations:
+        set_coloured_annots()
+    rm2svg(args.input, args.output, args.coloured_annotations,
+           args.width, args.height)
+
+def set_coloured_annots():
+    global stroke_colour
+    stroke_colour = {
+        0: "blue",
+        1: "red",
+        2: "white",
+        3: "yellow"
+    }
+
+
+def abort(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def rm2svg(input_file, output_name, coloured_annotations=False,
+           x_width=default_x_width, y_width=default_y_width):
+    # Read the file in memory. Consider optimising by reading chunks.
+    if coloured_annotations:
+        set_coloured_annots()
+
+    with open(input_file, 'rb') as f:
+        data = f.read()
+    offset = 0
+
+    # Is this a reMarkable .lines file?
+    
+    expected_header=b'reMarkable .lines file, version=#          '
+    if len(data) < len(expected_header) + 4:
+        abort('File too short to be a valid file')
+
+    fmt = '<{}sI'.format(len(expected_header))
+    header, nlayers = struct.unpack_from(fmt, data, offset); offset += struct.calcsize(fmt)
+    # print('header={} nlayers={}'.format(header, nlayers))
+    re_expected_header = f"^{str(expected_header,'utf-8').replace('#','([345])')}$"
+    re_expected_header_match = re.match(re_expected_header, str(header ,'utf-8'))
+    if (re_expected_header is None) or (nlayers < 1):
+        abort('Not a valid reMarkable file: <header={}> <nlayers={}'.format(header, nlayers))
+    _stroke_fmt_by_vers = {
+        '3': '<IIIfI',
+	'5': '<IIIfII' }
+    _stroke_fmt = _stroke_fmt_by_vers[re_expected_header_match.groups(1)[0]]
+    output = open(output_name, 'w')
+    output.write('<svg xmlns="http://www.w3.org/2000/svg" height="{}" width="{}">\n'.format(y_width, x_width)) # BEGIN Notebook
+    output.write('  <defs>\n <filter id="f1" x="0" y="0">\n <feGaussianBlur in="SourceGraphic" stdDeviation="2" />\n </filter>\n </defs>')
+
+    # Iterate through layers on the page (There is at least one)
+    for layer in range(nlayers):
+        print('New layer')
+        fmt = '<I'
+        (nstrokes,) = struct.unpack_from(fmt, data, offset); offset += struct.calcsize(fmt)
+
+        print('nstrokes={}'.format(nstrokes))
+        # Iterate through the strokes in the layer (If there is any)
+        for stroke in range(nstrokes):
+            fmt = _stroke_fmt
+            stroke_data = struct.unpack_from(fmt, data, offset)
+            offset += struct.calcsize(fmt)
+            pen, colour, i_unk, width = stroke_data[:4]
+            nsegments = stroke_data[-1]
+            print('pen={} colour={} i_unk={} width={} nsegments={}'.format(pen,colour,i_unk,width,nsegments))
+            opacity = 1
+            last_x = -1.; last_y = -1.; last_lwidth = -1.
+
+            #if i_unk != 0: # No theory on that one
+                #print('Unexpected value at offset {}'.format(offset - 12))
+            if pen == 0 or pen == 1 or pen == 14 or pen == 12:
+                pass # Dynamic width, will be truncated into several strokes
+            elif pen == 2 or pen == 4 or pen == 17 or pen == 15: # Pen / Fineliner
+                width = 32 * width * width - 116 * width + 107
+            elif pen == 3 or pen == 16: # Marker
+                width = 64 * width - 112
+                opacity = 0.9
+            elif pen == 5 or pen == 18: # Highlighter
+                width = 30
+                opacity = 0.2
+                if coloured_annotations:
+                    colour = 3
+            elif pen == 6: # Eraser
+                width = 1280 * width * width - 4800 * width + 4510
+                colour = 2
+            elif pen == 7 or pen == 13: # Pencil-Sharp
+                width = 16 * width - 27
+                opacity = 0.9
+            elif pen == 8: # Erase area
+                opacity = 0.
+            else: 
+                print('Unknown pen: {}'.format(pen))
+                opacity = 0.
+
+            width /= 2.3 # adjust for transformation to A4
+            
+            print('Stroke {}: pen={}, colour={}, width={}, nsegments={}'.format(stroke, pen, colour, width, nsegments))
+            output.write('<g style="fill: {}; opacity: {}">\n'.format(stroke_colour[colour], opacity))
+
+            # Iterate through the segments to form a polyline
+            for segment in range(nsegments):
+                fmt = '<ffffff'
+                xpos, ypos, speed, tilt, lwidth, pressure = struct.unpack_from(fmt, data, offset); offset += struct.calcsize(fmt)
+                print('(x,y)=({},{}) (speed, tilt, width, pressure)=({},{},{},{})'.format(xpos,ypos,speed,tilt,lwidth,pressure))
+                #xpos += 60
+                #ypos -= 20
+                ratio = (y_width/x_width)/(1872/1404)
+                print('ratio={}'.format(ratio))
+                if ratio > 1:
+                    xpos = ratio*((xpos*x_width)/1404)
+                    ypos = (ypos*y_width)/1872
+                else:
+                    xpos = (xpos*x_width)/1404
+                    ypos = (1/ratio)*(ypos*y_width)/1872
+
+
+                output.write('<circle cx="{}" cy="{}" r="{}"/>\n'.format(xpos, ypos, lwidth/2))
+                
+                if last_x != -1.:
+                    # Add a line segment - a parallelogram
+
+                    x0 = last_x; y0 = last_y
+                    x1 = xpos; y1 = ypos
+                    if x1-x0 != 0 and y1-y0 != 0:
+
+                        # Find the direct line
+                        a = (y1-y0)/(x1-x0)
+                        b = y1 - a*x1
+
+                        # Find the perpendulicar on x0
+                        m0 = -1/a
+                        c0 = y0 - m0*x0
+
+                        # Find the perpendulicar on x1
+                        m1 = m0
+                        c1 = y1 - m1*x1
+
+                        # Compute the points from x0 from distance d
+                        d = last_lwidth / 2
+                        x0_0 = x0 - (d / math.sqrt(1+(m0*m0)))
+                        y0_0 = m0*x0_0+c0
+                        x0_1 = x0 + (d / math.sqrt(1+(m0*m0)))
+                        y0_1 = m0*x0_1+c0
+
+                        # Compute the points from x1 from distance d
+                        d = lwidth / 2
+                        x1_0 = x1 - (d / math.sqrt(1+(m1*m1)))
+                        y1_0 = m1*x1_0+c1
+                        x1_1 = x1 + (d / math.sqrt(1+(m1*m1)))
+                        y1_1 = m1*x1_1+c1
+
+                        output.write('<polygon points="{} {}, {} {}, {} {}, {} {}"/>\n'.format(x0_0,y0_0,x0_1,y0_1,x1_1,y1_1,x1_0,y1_0))
+
+                    else:
+                        pass
+
+
+
+                last_x = xpos; last_y = ypos; last_lwidth = lwidth
+            output.write('</g>\n')
+
+    # Overlay the page with a clickable rect to flip pages
+    output.write('</svg>') # END notebook
+    output.close()
+
+if __name__ == "__main__":
+    main()
